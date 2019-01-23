@@ -1,0 +1,18 @@
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xmlns:ext="http://www.liquibase.org/xml/ns/dbchangelog-ext"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-3.1.xsd
+    http://www.liquibase.org/xml/ns/dbchangelog-ext http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-ext.xsd">
+
+    <changeSet id="0" author="system" runOnChange="true">
+        <preConditions onFail="MARK_RAN" onFailMessage="Skip initial schema creation because database is not empty">
+            <and>
+                <not><tableExists tableName="accounts"/></not>
+                <not><changeSetExecuted id="0" author="system" changeLogFile="init.xml"/></not>
+            </and>
+        </preConditions>
+        <sqlFile path="init/init.sql" relativeToChangelogFile="true" encoding="UTF-8"/>
+    </changeSet>
+
+</databaseChangeLog>

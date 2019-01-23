@@ -1,0 +1,204 @@
+buildscript {
+    dependencies {
+        classpath "org.springframework.boot:spring-boot-gradle-plugin:2.0.0.RELEASE"
+    }
+}
+
+plugins {
+    id 'java'
+}
+
+group 'com.bugtracking'
+version '1.0-SNAPSHOT'
+
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+repositories {
+    mavenCentral()
+}
+
+apply plugin: 'org.springframework.boot'
+apply plugin: 'io.spring.dependency-management'
+apply plugin: 'java'
+
+
+configurations {
+    driver
+}
+
+dependencies {
+    driver group: 'mysql', name: 'mysql-connector-java', version: '5.1.16'
+}
+
+bootJar {
+    baseName = 'bug-tracker-server'
+}
+
+Map<String, Object> readSpringConfig(Map<String, String> propertiesToOverride = null) {
+    ant {
+        if (propertiesToOverride != null) {
+            propertiesToOverride.forEach { k, v ->
+                property(name: k, value: v)
+            }
+        }
+        property(file: "$projectDir/config/application.properties")
+        property(file: "$projectDir/application.properties")
+        property(file: "$projectDir/src/main/resources/application.properties")
+    }
+
+    return ant.properties
+}
+
+URLClassLoader loader = GroovyObject.class.classLoader
+configurations.driver.each {File file ->
+    loader.addURL(file.toURL())
+}
+
+def addDbUserIfNotExistFn(Map<String, String> propertiesToOverride = null) {
+    if (propertiesToOverride == null) {
+        propertiesToOverride = new HashMap<>();
+    }
+    propertiesToOverride.putAll([ "datasource.url.driver.prefix": "mysql"]);
+    def appConfig = readSpringConfig(propertiesToOverride);
+
+    GroovyObject.class.classLoader.loadClass("com.mysql.jdbc.Driver")
+
+    project.ext.db = [
+            driver: 'com.mysql.jdbc.Driver',
+            url: "${appConfig.'datasource.baseurl'}/information_schema",
+            user: appConfig.'spring.datasource.username',
+            password: appConfig.'spring.datasource.password',
+            schema: appConfig.'datasource.schema',
+            root_password: project.properties.get('database.root.password')
+    ]
+
+    def sql = null;
+    try {
+        sql = groovy.sql.Sql.newInstance(db.url, db.user, db.password, db.driver)
+        db.user_exists = 1 == sql.rows("SELECT 1 FROM SCHEMA_PRIVILEGES WHERE GRANTEE IN "
+                + " ("
+                + "    CONCAT('\\'', SUBSTRING_INDEX(USER(), '@', 1), '\\'@\\'%\\''), "
+                + "    CONCAT('\\'', SUBSTRING_INDEX(USER(), '@', 1), '\\'@\\'', SUBSTRING_INDEX(USER(), '@', -1) ,'\\'')"
+                + " ) AND TABLE_SCHEMA = ? LIMIT 1", [db.schema]).size()
+    } catch (Exception ex) {
+        db.user_exists = false
+    } finally {
+        if (sql != null) {
+            sql.close()
+        }
+    }
+
+    if (!db.user_exists) {
+
+        if (db.root_password == null) {
+            ant.input(message: "\nEnter mysql root password or restart build with property (option -P) 'database.root.password=<your db root password>':", addproperty: "db.root_password") { t ->
+                handler(type: 'secure')
+            }
+            if (null == ant.getProperties().get('db.root_password')) {
+                throw new BuildCancelledException("\nCan not read root database password from console.\nMost likely you use IDE which does nto attach " +
+                        "system.in to gradle. Restart from console or add property (option -P) 'database.root.password'")
+            } else {
+                db.root_password = ant.getProperties().get('db.root_password')
+            }
+        }
+
+        sql = groovy.sql.Sql.newInstance(db.url, 'root', db.root_password, db.driver)
+        try {
+            def hostName = sql.rows("SELECT SUBSTRING_INDEX(USER(), '@', -1)").get(0).getAt(0)
+            sql.execute("GRANT ALL ON ${db.schema}.* TO ?@? IDENTIFIED BY ?".toString(), [db.user, hostName, db.password])
+        } finally {
+            sql.close()
+        }
+    }
+}
+
+def createDbSchemaFn() {
+    def sql = groovy.sql.Sql.newInstance(db.url, db.user, db.password, db.driver)
+    try {
+        sql.execute "CREATE SCHEMA IF NOT EXISTS ${db.schema}".toString()
+    } finally {
+        sql.close()
+    }
+}
+
+def reCreateDbSchemaFn() {
+    def sql = groovy.sql.Sql.newInstance(db.url, db.user, db.password, db.driver)
+    try {
+        sql.execute "DROP SCHEMA IF EXISTS ${db.schema}".toString()
+        sql.execute "CREATE SCHEMA ${db.schema}".toString()
+    } finally {
+        sql.close()
+    }
+}
+
+task create_db {
+    description "Create database schema in MySQL and grants privileges for user. Create database user if not exists (ask root database user password to create user)"
+    onlyIf {
+        return (!project.hasProperty("skip.init.db") || "false".equalsIgnoreCase(project.properties.get("skip.init.db")))
+    }
+
+    doLast {
+        addDbUserIfNotExistFn();
+        createDbSchemaFn();
+    }
+}
+
+task init_db {
+    group = "build"
+    description "Initialize database completely (check/create schema, check/create user, etc) to start application"
+    dependsOn 'create_db'
+    onlyIf {
+        return !tasks['clean_db'].state.executed && !project.hasProperty("skip.init.db") || "false".equalsIgnoreCase(project.properties.get("skip.init.db"))
+    }
+    bootRun.dependsOn it
+}
+
+task clean_db {
+    group = "build"
+    description "Clean database in MySQL (drop schema and create schema)"
+    onlyIf {
+        return (!project.hasProperty("skip.clean.db") || "false".equalsIgnoreCase(project.properties.get("skip.clean.db")))
+    }
+
+    doLast {
+        addDbUserIfNotExistFn();
+        reCreateDbSchemaFn();
+    }
+}
+
+task create_clean_test_db {
+    group "verification"
+    description "Create database schema for testing in MySQL and grants privileges for user. Create database user if not exists (ask root database user password to create user)"
+    onlyIf {
+        return !project.hasProperty("skip.tests") && (!project.hasProperty("skip.init.db") || "false".equalsIgnoreCase(project.properties.get("skip.init.db")))
+    }
+
+    doLast {
+        addDbUserIfNotExistFn(['datasource.schema.suffix' : project.properties.get("testing.db.schema.suffix")]);
+        reCreateDbSchemaFn()
+        println "Test database has been re-created"
+        logger.info("Test database has been re-created")
+    }
+}
+
+test {
+    dependsOn 'create_clean_test_db'
+    systemProperty "datasource.schema.suffix", project.properties.get("testing.db.schema.suffix")
+}
+
+dependencies {
+    compile("org.springframework.boot:spring-boot-starter-web")
+    compile("org.springframework.data:spring-data-jpa:2.0.4.RELEASE")
+    compile("org.springframework.boot:spring-boot-starter-data-jpa")
+    compile("mysql:mysql-connector-java:5.1.45")
+    compile("org.liquibase:liquibase-core:3.5.3")
+    compile("org.hibernate:hibernate-spatial:5.2.14.Final")
+    compile("io.springfox:springfox-swagger-ui:2.7.0")
+    compile("io.springfox:springfox-swagger2:2.7.0")
+
+    testCompile("org.springframework:spring-test")
+    testCompile("org.springframework.boot:spring-boot-starter-test")
+    testCompile("junit:junit")
+    testCompile("org.apache.commons:commons-lang3:3.7")
+}
